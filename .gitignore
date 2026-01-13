@@ -1,0 +1,17 @@
+# Build output folders
+Debug/
+Release/
+
+# IDE specific
+.settings/
+.metadata/
+
+# Object and binary files
+*.o
+*.elf
+*.map
+*.hex
+*.bin
+
+# Launch files
+*.launch
