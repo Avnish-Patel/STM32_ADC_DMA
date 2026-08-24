@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include"stdio.h"
 #include"string.h"
+#include <math.h>
 
 /* USER CODE END Includes */
 
@@ -33,6 +34,15 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define ADC_VREF        3.3f
+#define ADC_MAX_VALUE   4095.0f
+
+#define R_FIXED         9780.0f
+
+#define NTC_R25         100000.0f
+#define NTC_BETA        3950.0f
+#define NTC_T25         298.15f
 
 /* USER CODE END PD */
 
@@ -50,8 +60,10 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-uint16_t adc_buf[3];
+uint16_t adc_buf[300];
 char uart_buf[100];
+
+volatile uint8_t data_ready =0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,6 +79,50 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+float ADC_ToVoltage(uint16_t adc)
+{
+    return ((float)adc * 3.3f) / 4095.0f;
+}
+
+float Thermistor_ToResistance(uint16_t adc)
+{
+    float voltage = ADC_ToVoltage(adc);
+
+    if (voltage <= 0.0f || voltage >= ADC_VREF)
+        return 0.0f;
+
+    return R_FIXED * voltage / (ADC_VREF - voltage);
+}
+
+float Thermistor_ToTemperature(uint16_t adc)
+{
+    float resistance = Thermistor_ToResistance(adc);
+
+    if (resistance <= 0.0f)
+        return -999.0f;
+
+    float temperature_K =
+        1.0f /
+        (
+            (1.0f / NTC_T25) +
+            (logf(resistance / NTC_R25) / NTC_BETA)
+        );
+
+    return temperature_K - 273.15f;
+}
+
+
+float LDR_ToResistance(uint16_t adc)
+{
+    float voltage = ADC_ToVoltage(adc);
+
+    if (voltage <= 0.0f || voltage >= ADC_VREF)
+        return 0.0f;
+
+    return R_FIXED * (ADC_VREF - voltage) / voltage;
+}
+
 
 /* USER CODE END 0 */
 
@@ -105,14 +161,60 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start(&htim2);
-  HAL_ADC_Start_DMA(&hadc1,(uint32_t*)adc_buf,3);
+  HAL_ADC_Start_DMA(&hadc1,(uint32_t*)adc_buf,300);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+  while (1) {
+
+      if (data_ready) {
+
+          data_ready = 0;
+
+          uint32_t pot_sum = 0;
+          uint32_t ldr_sum = 0;
+          uint32_t thermistor_sum = 0;
+
+          for (uint16_t i = 0; i < 100; i++){
+              pot_sum        += adc_buf[i * 3];
+              ldr_sum        += adc_buf[(i * 3) + 1];
+              thermistor_sum += adc_buf[(i * 3) + 2];
+          }
+
+          uint16_t pot_avg = pot_sum / 100;
+
+          uint16_t ldr_avg = ldr_sum / 100;
+
+          uint16_t thermistor_avg = thermistor_sum / 100;
+
+          float pot_voltage = ADC_ToVoltage(pot_avg);
+
+          float thermistor_resistance = Thermistor_ToResistance(thermistor_avg);
+
+          float temperature = Thermistor_ToTemperature(thermistor_avg);
+
+          float ldr_resistance = LDR_ToResistance(ldr_avg);
+
+          int len = snprintf( uart_buf,sizeof(uart_buf),
+              " POT        : %.3f V\r\n"
+              " TEMPERATURE: %.2f C\r\n"
+              " NTC        : %.2f kOhm\r\n"
+              " LDR        : %.2f kOhm\r\n"
+              "\r\n",
+              pot_voltage,
+              temperature,
+              thermistor_resistance / 1000.0f,
+              ldr_resistance / 1000.0f
+          );
+
+          if (len > 0)
+          {
+              HAL_UART_Transmit( &huart1, (uint8_t *)uart_buf, len, HAL_MAX_DELAY );
+          }
+          HAL_ADC_Start_DMA( &hadc1, (uint32_t *)adc_buf, 300 );
+      }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -178,6 +280,7 @@ static void MX_ADC1_Init(void)
 
   /* USER CODE END ADC1_Init 0 */
 
+  ADC_AnalogWDGConfTypeDef AnalogWDGConfig = {0};
   ADC_ChannelConfTypeDef sConfig = {0};
 
   /* USER CODE BEGIN ADC1_Init 1 */
@@ -203,6 +306,18 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
+  /** Configure the analog watchdog
+  */
+  AnalogWDGConfig.WatchdogMode = ADC_ANALOGWATCHDOG_SINGLE_REG;
+  AnalogWDGConfig.HighThreshold = 0;
+  AnalogWDGConfig.LowThreshold = 0;
+  AnalogWDGConfig.Channel = ADC_CHANNEL_0;
+  AnalogWDGConfig.ITMode = DISABLE;
+  if (HAL_ADC_AnalogWDGConfig(&hadc1, &AnalogWDGConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
   sConfig.Channel = ADC_CHANNEL_0;
@@ -215,8 +330,9 @@ static void MX_ADC1_Init(void)
 
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Channel = ADC_CHANNEL_3;
   sConfig.Rank = 2;
+//  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -224,7 +340,7 @@ static void MX_ADC1_Init(void)
 
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Channel = ADC_CHANNEL_4;
   sConfig.Rank = 3;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
@@ -255,9 +371,9 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 4999;
+  htim2.Init.Prescaler = 9999;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 99;
+  htim2.Init.Period =99;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -367,20 +483,10 @@ static void MX_GPIO_Init(void)
 
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc){
-	static uint8_t count=0;
+
 	if(hadc->Instance == ADC1){
-
-
-		count++;
-		if(count>=100){
-			//       printing after every 50 reads to make it readable
-			int len=sprintf(uart_buf," POT value  %u\r\n THERMISTER value  %u\r\n LDR value  %u\r\n",adc_buf[0],adc_buf[1],adc_buf[2]);
-
-			HAL_UART_Transmit(&huart1,(uint8_t*)uart_buf,len,HAL_MAX_DELAY);
-
-			HAL_GPIO_TogglePin(GPIOG,GPIO_PIN_14);
-			count=0;
-		}
+		data_ready =1;
+		 HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_14);
 	}
 }
 /* USER CODE END 4 */
@@ -406,7 +512,7 @@ void Error_Handler(void)
   * @param  file: pointer to the source file name
   * @param  line: assert_param error line source number
   * @retval None
- **/
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
